@@ -9,22 +9,32 @@ use std::path::Path;
 
 const SUBWINDOW_W: u32 = 24;
 const SUBWINDOW_H: u32 = 24;
-const CLASSIFIER_SIZE: usize = 3;
+const CLASSIFIER_SIZE: usize = 50;
 
 /// Parses program arguments and loads image data
-fn arg_parse() -> (Vec<GrayImage>, Vec<GrayImage>) {
-    let usage = "viola_jones [POSITIVE] [NEGATIVE]";
+fn arg_parse() -> (Vec<GrayImage>, Vec<GrayImage>, Option<Vec<GrayImage>>, Option<Vec<GrayImage>>) {
+    let usage = "viola_jones [POSITIVE] [NEGATIVE] TEST_POS TEST_NEG";
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    assert!(args.len() == 2, usage);
+    assert!(args.len() >= 2 && args.len() <= 4, usage);
 
     let pos_path = Path::new(args.get(0).unwrap());
     let neg_path = Path::new(args.get(1).unwrap());
 
+    let mut pos_tests = None;
+    let mut neg_tests = None;
+    if args.len() > 2 {
+        let pos_test_path = Path::new(args.get(2).unwrap());
+        let neg_test_path = Path::new(args.get(3).unwrap());
+
+        pos_tests = Some(grays(read_img_data(&pos_test_path)));
+        neg_tests = Some(grays(read_img_data(&neg_test_path)));
+    }
+
     let pos_images = grays(read_img_data(&pos_path));
     let neg_images = grays(read_img_data(&neg_path));
 
-    (pos_images, neg_images)
+    (pos_images, neg_images, pos_tests, neg_tests)
 }
 
 /// Reads directory for image files. Ignores subdirectories
@@ -56,6 +66,21 @@ fn grays(images: Vec<DynamicImage>) -> Vec<GrayImage> {
           .collect()
 }
 
+/// Creates a vector of Images with their tag.
+fn generate_test_data(pos_data: Vec<GrayImage>,
+                      neg_data: Vec<GrayImage>) -> Vec<(IntegralImage, usize)>
+{
+    let mut test_data = Vec::new();
+    for img in pos_data {
+        test_data.push((IntegralImage::new(&img), 1));
+    }
+    for img in neg_data {
+        test_data.push((IntegralImage::new(&img), 0));
+    }
+
+    test_data
+}
+
 /// Creates as many features as can fit in the windows size.
 fn generate_features(width: usize, height: usize) -> Vec<HaarFeature> {
     let mut features = Vec::new();
@@ -71,6 +96,10 @@ fn generate_features(width: usize, height: usize) -> Vec<HaarFeature> {
                                                         height,
                                                         FeatureType::HorizontalTriplet);
     features.append(&mut hori_trip_feats);
+    let mut hori_trip_feats = HaarFeature::gen_features(width,
+                                                        height,
+                                                        FeatureType::VerticalTriplet);
+    features.append(&mut hori_trip_feats);
     let mut checkered_feats = HaarFeature::gen_features(width,
                                                         height,
                                                         FeatureType::Checkered);
@@ -78,9 +107,13 @@ fn generate_features(width: usize, height: usize) -> Vec<HaarFeature> {
     features
 }
 
+/// Performs AdaBoost to generate a strong classifier
+/// The testing data should not be part of this functions parameters, but I
+/// was interested in some intermediate classifier testing.
 fn adaboost<'a>(features: &'a Vec<HaarFeature>,
                 pos_data: &mut Vec<(IntegralImage, f64)>,
-                neg_data: &mut Vec<(IntegralImage, f64)>)
+                neg_data: &mut Vec<(IntegralImage, f64)>,
+                test_data: &Vec<(IntegralImage, usize)>)
                     -> Vec<(&'a HaarFeature, f64, f64, f64)>
 {
     let mut strong_classifier = Vec::new();
@@ -93,6 +126,7 @@ fn adaboost<'a>(features: &'a Vec<HaarFeature>,
         update_weights(min_feat, min_err, threshold, polarity, pos_data, neg_data);
         println!("min_feature {:?}, min_err: {}, threshold {}", min_feat, min_err, threshold);
         strong_classifier.push((min_feat, min_err, threshold, polarity));
+        strong_classify(&strong_classifier, test_data);
     }
     strong_classifier
 }
@@ -132,12 +166,16 @@ fn find_best_feature<'a>(features: &'a Vec<HaarFeature>,
 }
 
 fn strong_classify(strong_classifier: &Vec<(&HaarFeature, f64, f64, f64)>,
-                   pos_testing: &Vec<IntegralImage>,
-                   neg_testing: &Vec<IntegralImage>) {
+                   testing: &Vec<(IntegralImage, usize)>) {
     let mut correct = 0;
     let mut detected = 0.0;
     let mut false_positives = 0;
-    for img in pos_testing.iter() {
+    let mut total_faces = 0.0;
+    // Test positives
+    for &(ref img, tag) in testing.iter() {
+        if tag == 1 {
+            total_faces += 1.0;
+        }
         let mut sum = 0.0;
         let mut alpha_sum = 0.0;
         for &(feat, err, threshold, sign) in strong_classifier.iter() {
@@ -147,19 +185,24 @@ fn strong_classify(strong_classifier: &Vec<(&HaarFeature, f64, f64, f64)>,
             let alpha = alpha_constant(beta_constant(err));
             sum += class * alpha;
             alpha_sum += alpha;
-            println!("{}", alpha);
         }
 
         let prediction = if sum >= 0.5 * alpha_sum { 1 } else { 0 };
-        // Correct
-        if prediction == 1 {
+
+        if prediction == tag {
             correct += 1;
+            if tag == 1 {
+                detected += 1.0;
+            }
+        } else {
+            if prediction == 1 && tag == 0 {
+                false_positives += 1;
+            }
         }
     }
 
-    let total_data = (pos_testing.len() + neg_testing.len()) as f64;
-    println!("{} feature classifier got {} correct, {} false positives, detected {}% of faces.",
-             strong_classifier.len(), correct, false_positives, detected / total_data);
+    println!("{} feature classifier got {} correct, {} false positives, detected {} out of {} faces.",
+             strong_classifier.len(), correct, false_positives, detected, total_faces);
 }
 
 /// Find a threshold and polarity for feature results
@@ -297,7 +340,7 @@ fn alpha_constant(epsilon: f64) -> f64 {
 }
 
 fn main() {
-    let (pos_images, neg_images) = arg_parse();
+    let (pos_images, neg_images, pos_test, neg_test) = arg_parse();
 
     // Convert each image to integral image and map to a weight
     let mut pos_data = pos_images.iter()
@@ -307,17 +350,21 @@ fn main() {
                                  .map(|img| (IntegralImage::new(&img), 1.0))
                                  .collect::<Vec<(IntegralImage, f64)>>();
 
-
-    // Test on 5% of each data set.
-    let mut test_data = Vec::new();
-    for _ in 0..pos_data.len() / 20 {
-        let item = pos_data.pop().unwrap();
-        test_data.push(item);
-    }
-    for _ in 0..neg_data.len() / 40 {
-        let item = neg_data.pop().unwrap();
-        test_data.push(item);
-    }
+    // If test data exists use it, otherwise use half of the training set
+    let test_data = if pos_test.is_some() {
+        generate_test_data(pos_test.unwrap(), neg_test.unwrap())
+    } else {
+        let mut data = Vec::new();
+        for _ in 0..pos_data.len() / 2 {
+            let item = pos_data.pop().unwrap();
+            data.push((item.0, 1));
+        }
+        for _ in 0..neg_data.len() / 2 {
+            let item = neg_data.pop().unwrap();
+            data.push((item.0, 0));
+        }
+        data
+    };
 
     println!("Done loading training. {} pos, {} neg, {} training",
              pos_data.len(), neg_data.len(), test_data.len());
@@ -326,5 +373,10 @@ fn main() {
     println!("Generated {} features", features.len());
 
     println!("Performing adaboost");
-    let strong_classifier = adaboost(&features, &mut pos_data, &mut neg_data);
+    let strong_classifier = adaboost(&features, &mut pos_data, &mut neg_data, &test_data);
+
+    println!("Classifier feature dump");
+    for &(feat, err, thres, sign) in strong_classifier.iter() {
+        println!("{:?} {} {} {}", feat, err, thres, sign);
+    }
 }
