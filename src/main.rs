@@ -78,83 +78,156 @@ fn generate_features(width: usize, height: usize) -> Vec<HaarFeature> {
     features
 }
 
+fn adaboost<'a>(features: &'a Vec<HaarFeature>,
+                pos_data: &mut Vec<(IntegralImage, f64)>,
+                neg_data: &mut Vec<(IntegralImage, f64)>)
+                    -> Vec<(&'a HaarFeature, f64, f64, f64)>
+{
+    let mut strong_classifier = Vec::new();
+    for _ in 0..CLASSIFIER_SIZE {
+        normalize_weights(pos_data, neg_data);
+
+        let (min_feat, min_err, threshold, polarity) =
+            find_best_feature(features, pos_data, neg_data);
+
+        update_weights(min_feat, min_err, threshold, polarity, pos_data, neg_data);
+        println!("min_feature {:?}, min_err: {}, threshold {}", min_feat, min_err, threshold);
+        strong_classifier.push((min_feat, min_err, threshold, polarity));
+    }
+    strong_classifier
+}
+
 /// Finds the feature with least amount of error and returns a reference to it
 /// Threshold for classification is initialized to 0 and updated on every
 /// iteration of a feature.
 fn find_best_feature<'a>(features: &'a Vec<HaarFeature>,
                          pos_data: &Vec<(IntegralImage, f64)>,
                          neg_data: &Vec<(IntegralImage, f64)>)
-                             -> (&'a HaarFeature, f64, f64)
+                             -> (&'a HaarFeature, f64, f64, f64)
 {
     let mut min_error = std::f64::MAX;
     let mut min_feat = &features[0];
     let mut threshold = std::f64::MAX;
+    let mut polarity = 1.0;
 
     for feat in features.iter() {
-        let pos_res = pos_data.iter()
+        let  pos_res = pos_data.iter()
                               .map(|&(ref img, weight)| (feat.classify(img), weight))
                               .collect::<Vec<(isize, f64)>>();
         let neg_res = neg_data.iter()
                               .map(|&(ref img, weight)| (feat.classify(img), weight))
                               .collect::<Vec<(isize, f64)>>();
 
-        let new_threshold = calculate_threshold(threshold, &pos_res, &neg_res);
-        let err = calculate_error(threshold, 1.0, &pos_res, &neg_res);
+        let (feat_threshold, feat_polarity) = calculate_threshold(&pos_res, &neg_res);
+        let err = calculate_error(threshold, polarity, &pos_res, &neg_res);
 
         if err < min_error {
             min_error = err;
             min_feat = feat;
-            threshold = new_threshold;
+            threshold = feat_threshold;
+            polarity = feat_polarity
         }
     }
-    (min_feat, min_error, threshold)
+    (min_feat, min_error, threshold, polarity)
 }
 
-fn calculate_threshold(threshold: f64,
-                       pos_data: &Vec<(isize, f64)>,
-                       neg_data: &Vec<(isize, f64)>) -> f64
-{
-    10.0
-    /*
-    let (pos_total, pos_thres) = pos_data.iter().fold((0.0, 0.0),
-        |(tot, thres), &(val, w)| {
-            let new_val = if val.abs() < threshold.abs() {
-                thres + w
-            } else {
-                thres
-            };
-            (tot + w, new_val)
-        });
-    let (neg_total, neg_thres) = neg_data.iter().fold((0.0, 0.0),
-        |(tot, thres), &(val, w)| {
-            let new_val = if val.abs() < threshold.abs() {
-                thres + w
-            } else {
-                thres
-            };
-            (tot + w, new_val)
-        });
+fn strong_classify(strong_classifier: &Vec<(&HaarFeature, f64, f64, f64)>,
+                   pos_testing: &Vec<IntegralImage>,
+                   neg_testing: &Vec<IntegralImage>) {
+    let mut correct = 0;
+    let mut detected = 0.0;
+    let mut false_positives = 0;
+    for img in pos_testing.iter() {
+        let mut sum = 0.0;
+        let mut alpha_sum = 0.0;
+        for &(feat, err, threshold, sign) in strong_classifier.iter() {
+            let feat_sum = feat.classify(img) as f64;
+            let class = if feat_sum * sign < threshold * sign { 1.0 } else { 0.0 };
 
-    let val1 = pos_thres + (neg_total - neg_thres);
-    let val2 = neg_thres + (pos_total - pos_thres);
+            let alpha = alpha_constant(beta_constant(err));
+            sum += class * alpha;
+            alpha_sum += alpha;
+            println!("{}", alpha);
+        }
 
-    if val1 < val2 {
-        val1
-    } else {
-        val2
+        let prediction = if sum >= 0.5 * alpha_sum { 1 } else { 0 };
+        // Correct
+        if prediction == 1 {
+            correct += 1;
+        }
     }
-    */
+
+    let total_data = (pos_testing.len() + neg_testing.len()) as f64;
+    println!("{} feature classifier got {} correct, {} false positives, detected {}% of faces.",
+             strong_classifier.len(), correct, false_positives, detected / total_data);
+}
+
+/// Find a threshold and polarity for feature results
+/// Iterates through a sorted data set, obtaining the minimal error of all
+/// ways of parting the set in two.
+fn calculate_threshold(pos_data: &Vec<(isize, f64)>,
+                       neg_data: &Vec<(isize, f64)>) -> (f64, f64)
+{
+    // Group all data and add a tag for which set they were in
+    let mut all_data: Vec<(isize, f64, bool)> =
+        pos_data.iter().map(|val| (val.0, val.1, true))
+                .chain(neg_data.iter().map(|val| (val.0, val.1, false)))
+                .collect();
+
+    // Sort by feature values
+    all_data.sort_by(|a, b| (a.0).cmp(&b.0));
+
+    // Sum of positive weights, negative weights, positive weights below
+    // threshold, and negative weights below threshold
+    // pos_below, and neg_below are updated as we search
+    let pos_tot = pos_data.iter().fold(0.0, |accum, &(_, w)| accum + w);
+    let neg_tot = neg_data.iter().fold(0.0, |accum, &(_, w)| accum + w);
+    let mut pos_below = 0.0;
+    let mut neg_below = 0.0;
+
+    // init to 0th threshold values
+    let mut min_err = {
+        let err1 = pos_below + (neg_tot - neg_below);
+        let err2 = neg_below + (pos_tot - pos_below);
+
+        if err1 < err2 { err1 } else { err2 }
+    };
+    let mut threshold_index = 0;
+
+    for i in 1..all_data.len() {
+        let &(_, prev_w, prev_tag) = unsafe { all_data.get_unchecked(i - 1) };
+        if prev_tag { // positive case
+            pos_below += prev_w;
+        } else {
+            neg_below += prev_w;
+        }
+
+        let err1 = pos_below + (neg_tot - neg_below);
+        let err2 = neg_below + (pos_tot - pos_below);
+
+        let err = if err1 < err2 { err1 } else { err2 };
+        if err < min_err {
+            min_err = err;
+            threshold_index = i;
+        }
+    }
+
+    // ideally threshold would be average between first item left and right
+    // of threshold. Instead my error calculation calls equals to
+    let threshold = all_data.get(threshold_index).unwrap().0 as f64;
+    let polarity = if threshold < 0.0 { -1.0 } else { 1.0 };
+
+    (threshold, polarity)
 }
 
 /// Given the already classified data, calculates an error based off a
-/// threshold
+/// threshold and polarity
 fn calculate_error(threshold: f64,
                    sign: f64,
                    pos_data: &Vec<(isize, f64)>,
                    neg_data: &Vec<(isize, f64)>) -> f64
 {
     let mut error = 0.0;
-    let mut correct = 0;
     for &(val, weight) in pos_data.iter() {
         let val = val as f64;
 
@@ -162,9 +235,6 @@ fn calculate_error(threshold: f64,
         // If incorrect
         if class == 0 {
             error += weight;
-        }
-        else {
-            correct += 1;
         }
     }
     for &(val, weight) in neg_data.iter() {
@@ -175,31 +245,31 @@ fn calculate_error(threshold: f64,
         if class == 1 {
             error += weight;
         }
-        else {
-            correct += 1;
-        }
     }
     error
 }
 
 /// Updates the  weight values for the image samples
-fn update_weights(feature: &HaarFeature,
+fn update_weights(feat: &HaarFeature,
                   error: f64,
                   threshold: f64,
+                  sign: f64,
                   pos_data: &mut Vec<(IntegralImage, f64)>,
                   neg_data: &mut Vec<(IntegralImage, f64)>)
 {
     for &mut (ref img, ref mut weight) in pos_data.iter_mut() {
-        let val = if feature.classify(img).abs() as f64 > threshold { 1 } else { 0 };
-        // Correct classification
-        if val == 1 {
+        let val = feat.classify(img) as f64;
+        let class = if sign * val >= sign * threshold { 1 } else { 0 };
+        // Incorrect classification
+        if class == 0 {
             *weight *= beta_constant(error);
         }
     }
     for &mut (ref img, ref mut weight) in neg_data.iter_mut() {
-        let val = if feature.classify(img).abs() as f64 > threshold { 1 } else { 0 };
-        // Correct classification
-        if val == 0 {
+        let val = feat.classify(img) as f64;
+        let class = if sign * val > threshold { 1 } else { 0 };
+        // Incorrect classification
+        if class == 1 {
             *weight *= beta_constant(error);
         }
     }
@@ -226,7 +296,6 @@ fn alpha_constant(epsilon: f64) -> f64 {
     (1.0 / epsilon).log10()
 }
 
-
 fn main() {
     let (pos_images, neg_images) = arg_parse();
 
@@ -237,36 +306,25 @@ fn main() {
     let mut neg_data = neg_images.iter()
                                  .map(|img| (IntegralImage::new(&img), 1.0))
                                  .collect::<Vec<(IntegralImage, f64)>>();
-    println!("Done loading training. {} pos, {} neg", pos_data.len(), neg_data.len());
+
+
+    // Test on 5% of each data set.
+    let mut test_data = Vec::new();
+    for _ in 0..pos_data.len() / 20 {
+        let item = pos_data.pop().unwrap();
+        test_data.push(item);
+    }
+    for _ in 0..neg_data.len() / 40 {
+        let item = neg_data.pop().unwrap();
+        test_data.push(item);
+    }
+
+    println!("Done loading training. {} pos, {} neg, {} training",
+             pos_data.len(), neg_data.len(), test_data.len());
 
     let features = generate_features(SUBWINDOW_W as usize, SUBWINDOW_H as usize);
     println!("Generated {} features", features.len());
 
-    /*
-    let mut string_classifier = Vec::new();
-    for _ in 0..CLASSIFIER_SIZE {
-        normalize_weights(&mut pos_data,  &mut neg_data);
-
-        let (min_feat, min_err, threshold) = find_best_feature(&features, &pos_data, &neg_data);
-
-        update_weights(min_feat, min_err, threshold, &mut pos_data, &mut neg_data);
-        println!("min_feature {:?}, min_err: {}, threshold {}", min_feat, min_err, threshold);
-        best_feats.push((min_feat, beta_constant(min_err), threshold));
-
-        for &(feat, _, threshold) in best_feats.iter() {
-            let mut right = 0.0;
-            for &(ref img, _) in pos_data.iter() {
-                if (feat.classify(img).abs() as f64) > threshold {
-                    right += 1.0;
-                }
-            }
-            for &(ref img, _) in neg_data.iter() {
-                if (feat.classify(img).abs() as f64) < threshold {
-                    right += 1.0;
-                }
-            }
-            println!("Got {}% correct", right / (pos_data.len() +  neg_data.len()) as f64);
-        }
-    }
-    */
+    println!("Performing adaboost");
+    let strong_classifier = adaboost(&features, &mut pos_data, &mut neg_data);
 }

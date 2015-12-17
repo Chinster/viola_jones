@@ -1,5 +1,6 @@
 use image::{GrayImage, Pixel};
 
+#[derive(Debug)]
 pub struct IntegralImage {
     width: usize,
     height: usize,
